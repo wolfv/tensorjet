@@ -19,7 +19,7 @@ public:
     }}
 private:
     {states}
-}}
+}};
 
 namespace py = pybind11;
 
