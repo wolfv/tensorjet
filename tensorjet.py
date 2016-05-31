@@ -7,8 +7,10 @@ import subprocess
 class_template = """
 #include <cmath>
 #include <tuple>
+#include <armadillo>
 #include <pybind11/pybind11.h>
 
+using namespace arma;
 
 {consts}
 class TensorJet {{
@@ -41,22 +43,18 @@ def beauty(text):
     stdout, stderr = p.communicate(input=text)
     return stdout
 
+
 class Placeholder():
     fmt = '{type} {name}'
     def __init__(self, el):
         self.name = sanitize_name(el.name)
+        # extract shape from node def
+        node_def = el.node_def
+        shape = [int(i.size) for i in el.node_def.attr['shape'].shape.dim]
         self.el = el
-        try:
-            self.shape = [int(dim.size) for dim in el.attr['shape'].shape.dim]
-        except:
-            self.shape = []
-
+        self.dtype = get_type(el, shape)
     def __repr__(self):
-        if self.shape:
-            tmpl = '<{}>'.format(', '.join(str(s) for s in self.shape))
-            return self.fmt.format(type='Eigen::Matrix' + tmpl, name=self.name)
-        else:
-            return self.fmt.format(type='float', name=self.name)
+        return self.fmt.format(type=self.dtype, name=self.name)
 
 
 class OpRegister(object):
@@ -154,6 +152,7 @@ class IdentityOp(OpRegister):
     def registers(cls, op):
         return op == 'Identity'
 
+
 class SqueezeOp(OpRegister):
     fmt = 'auto {name} = {in1};'
     def __init__(self, el):
@@ -162,14 +161,33 @@ class SqueezeOp(OpRegister):
         self.input1 = sanitize_name(self.el.inputs[0].name)
 
     def __repr__(self):
+        # return '// squeeze {} is a noop'.format(self.el.inputs[0].eval())
         return self.fmt.format(name=self.name, in1=self.input1)
 
     @classmethod
     def registers(cls, op):
         return op == 'Squeeze'
 
+
+class CrossOp(OpRegister):
+    fmt = 'auto {name} = {in1}.cross({in2});'
+    def __init__(self, el):
+        self.el = el
+        self.name = sanitize_name(el.name)
+        self.input1 = sanitize_name(self.el.inputs[0].name)
+        self.input2 = sanitize_name(self.el.inputs[1].name)
+
+    def __repr__(self):
+        # return '// squeeze {} is a noop'.format(self.el.inputs[0].eval())
+        return self.fmt.format(name=self.name, in1=self.input1, in2=self.input2)
+
+    @classmethod
+    def registers(cls, op):
+        return op == 'Cross'
+
+
 class SliceOp(OpRegister):
-    fmt = 'auto {name} = {in1}[view{view}];'
+    fmt = 'auto {name} = {in1}({view});'
     def __init__(self, el):
         self.el = el
         self.name = sanitize_name(el.name)
@@ -179,7 +197,7 @@ class SliceOp(OpRegister):
         self.is1 = self.el.inputs[1].eval()
         self.is2 = self.el.inputs[2].eval()
         zip_slice = zip(self.is1, self.is2)
-        self.view = ''.join(['({}, {})'.format(a[0], a[1]) for a in zip_slice])
+        self.view = ', '.join(['span({}, {})'.format(a[0], a[1]) for a in zip_slice])
     def __repr__(self):
         return self.fmt.format(name=self.name, 
             in1=self.input1,
@@ -190,12 +208,29 @@ class SliceOp(OpRegister):
         return op == 'Slice'
 
 
+class NoOp(OpRegister):
+    fmt = '// No Op {name};'
+    def __init__(self, el):
+        self.el = el
+        self.name = sanitize_name(el.name)
+        # self.input1 = sanitize_name(self.el.inputs[0].name)
+
+    def __repr__(self):
+        return self.fmt.format(name=self.name)
+
+    @classmethod
+    def registers(cls, op):
+        return op == 'NoOp'
+
+
+
 def Op(el):
     for cls in OpRegister.__subclasses__():
         if cls.registers(el.type):
             return cls(el)
 
 dtype_map = {
+    'float': 'float',
     tf.float32: 'float',
     tf.float64: 'double',
     tf.int32: 'int',
@@ -207,8 +242,9 @@ dtype_map = {
 def sanitize_name(name):
     return name.split(':')[0].replace('/', '___')
 
-def get_type(el):
-    shape = el.get_shape()
+def get_type(el, shape=None):
+    if not shape:
+        shape = el.get_shape()
     try:
         dtype = el.dtype
     except:
@@ -216,22 +252,31 @@ def get_type(el):
     if not shape or len(shape) == 0 or len(shape) == 1 and shape[0] == 1:
         return 'float'
     else:
-        tmpl = '<{}>'.format(', '.join(str(s) for s in 
-            [dtype_map[dtype]] + [s for s in shape]))
-        return '{type}'.format(type='Array' + tmpl)
+        tmpl = '<{}>::fixed<{}>'.format(dtype_map[dtype], ', '.join(str(s) for s in 
+            [s for s in shape]))
+        return '{type}'.format(type='Mat' + tmpl)
 
+import numpy as np
 
 class Constant:
-    fmt = 'constexpr {dtype} {name} = {val};'
+    fmt = '{dtype} {name} = {val};'
 
     def __init__(self, el):
         self.el = el
         self.name = sanitize_name(el.name)
         self.value = el.values()[0]
         self.dtype = get_type(self.value)
+        self.is_array = False
+        self.shape = self.value.get_shape()
 
     def get_value(self):
-        return self.value.eval(session=sess)
+        val = self.value.eval(session=sess)
+        if type(val) == np.ndarray:
+            # convert to initializer list
+            val = '{}({})'.format(
+                get_type(self.value),
+                str(val).replace('[', '{').replace(']', '}').replace(' ', ', '))
+        return val
 
     def __repr__(self):
         return self.fmt.format(
